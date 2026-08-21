@@ -213,10 +213,6 @@ systemctl status apt-daily-upgrade.timer
 
 ---
 
-That’s enough for today. My next step will be setting up non-root admin users, because logging directly into `root` for daily homelab tasks is terrible practice—and building good habits now will pay off later in enterprise environments.
-
-Hello World !!!
-
 ### 5. Managing Users and Granular Permissions
 
 As promised, now we will tackle user management. There is allegedly a best practice prescribing that we manage Linux machines using a dedicated user—**NOT ROOT**. It makes sense: if your credentials get leaked, at least you can delete that user and start over without losing the entire hypervisor.
