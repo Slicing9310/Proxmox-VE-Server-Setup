@@ -214,3 +214,159 @@ systemctl status apt-daily-upgrade.timer
 ---
 
 That’s enough for today. My next step will be setting up non-root admin users, because logging directly into `root` for daily homelab tasks is terrible practice—and building good habits now will pay off later in enterprise environments.
+
+Hello World !!!
+
+### 5. Managing Users and Granular Permissions
+
+As promised, now we will tackle user management. There is allegedly a best practice prescribing that we manage Linux machines using a dedicated user—**NOT ROOT**. It makes sense: if your credentials get leaked, at least you can delete that user and start over without losing the entire hypervisor.
+
+In Proxmox, navigate to **Datacenter**, scroll down to **Permissions**, and click on the **Users** tab. If this is a fresh setup, you will only see `root@pam`.
+
+An important distinction to understand here is the difference between realm types:
+
+* **PAM (`@pam`):** These correspond directly to underlying Linux system users (used for SSH access to the base Debian OS). You can create a matching system user in the shell by running:
+```bash
+adduser xyz
+
+```
+
+
+Fill out the prompts and **do not forget** to add this user to the `sudo` group (`usermod -aG sudo xyz`), or you will lock yourself out of administrative SSH access.
+* **PVE (`@pve`):** These are Proxmox-native users created purely inside the GUI for managing hypervisor resources.
+
+Once created, you’ll notice the user has no real access yet because they haven’t been assigned permissions or a group. You *could* assign permissions directly to a single user, but as your homelab grows, this gets messy fast. Best practice is to assign permissions to a **Group**.
+
+1. Go to the **Groups** tab and click **Create**.
+2. Give it a name and a comment (helpful if the naming scheme is abstract).
+3. Head over to **Permissions** and assign the appropriate role to the group.
+
+Personally, I assign my daily admin user slightly lower permissions than root. A good admin doesn't need all-powerful access for basic daily tasks—and shouldn't become a single point of failure. Imagine being on vacation, having the time of your life, and suddenly having to remotely debug a critical permission mess you made because you were logged in as superuser.
+
+Add your newly created user to the group, log out of root, and log back in as your daily driver to test your access.
+
+---
+
+### 6. Storage & Hyperconverged NAS: TrueNAS SCALE VM
+
+I don't have infinite financial resources for my backup and home services, so I use this PVE server to consolidate as much as possible. My favorite approach starts with setting up a **TrueNAS SCALE** VM for SMB/NFS/iSCSI storage and backups.
+
+I’ve heard all the lectures about why you shouldn't run TrueNAS in a VM. You guys are technically right, but since this is my server, I do what I want with it!
+
+Why TrueNAS SCALE? One word: **ZFS**.
+
+Why not just use ZFS directly on Proxmox? I take ZFS wherever I can get it. I use Proxmox's built-in ZFS for VM/LXC storage performance, and TrueNAS's ZFS implementation to manage media and phone photo backups.
+
+#### Passthrough Disks by ID
+
+My setup uses a primary NVMe drive for core VMs/LXCs, plus two mechanical HDDs in a ZFS mirror for extra virtual storage. For TrueNAS, I have two *additional* dedicated mechanical drives that need to be passed through directly using their unique disk IDs; otherwise, TrueNAS won't recognize them properly.
+
+1. Download the TrueNAS SCALE ISO into Proxmox and create the VM.
+2. Open the Proxmox terminal to identify your physical drives:
+```bash
+lsblk
+
+```
+
+
+3. List the unique serial-based disk paths:
+```bash
+ls /dev/disk/by-id/
+
+```
+
+
+4. Cross-reference the serial numbers with the **Disks** tab under your Proxmox node in the GUI to ensure you have the exact right drives.
+5. Pass the raw drives directly to your TrueNAS VM (assuming VM ID `100`):
+```bash
+qm set 100 -scsi1 /dev/disk/by-id/ata-WD7000CM006-2ZSFD2_XS345FZAC,serial=XS345FZAC
+qm set 100 -scsi2 /dev/disk/by-id/ata-WD5000FM008-5ZSDF4_FST5HGSTZ,serial=FST5HGSTZ
+
+```
+
+
+
+*Breakdown:* `qm set [VM_ID]` tells Proxmox which VM to modify, `-scsiX` specifies the virtual controller slot, and passing the `/dev/disk/by-id/...` path routes the physical disk. In my setup, explicitly defining the `,serial=` flag at the end was mandatory—Proxmox refused to surface the drives inside TrueNAS properly without it.
+
+Boot into TrueNAS, hit the Web UI, and your raw drives will be ready for pool creation. If I ever build a second dedicated hardware box, I'll run TrueNAS bare-metal, but inside PVE it works amazingly well.
+
+---
+
+### 7. Media Streaming: Dedicated Jellyfin VM
+
+A lot of online guides suggest running Jellyfin inside an LXC container and mounting media via an SMB share. In my testing, that introduced unnecessary instability. I read through the official documentation and decided to give Jellyfin its own dedicated Ubuntu VM instead.
+
+#### GPU Hardware Transcoding Reality Check
+
+If you want to stream 4K or HDR content without melting your CPU, you **must** pass through a dedicated GPU for hardware transcoding.
+
+Online opinions on graphics cards vary wildly, but here is my actual experience testing two budget GPUs:
+
+* **PNY NVIDIA T1000 (4GB):** Performed marvelously at 1080p, but struggled hard with heavy 4K HDR streams.
+* **Sparkle Intel Arc A310 OMNI:** Outperformed the NVIDIA card without breaking a sweat. Intel QuickSync on the Arc lineup is incredible for media servers.
+
+#### PCI Passthrough Setup
+
+To dedicate the Intel Arc GPU to the Jellyfin VM:
+
+1. Go to the VM's **Hardware** tab in Proxmox.
+2. Add a **PCI Device**, select the GPU as a **Raw Device**, enable **All Functions**, and leave *Primary GPU* **unchecked**.
+3. Do this *before* installing Ubuntu so the installer automatically picks up the third-party hardware drivers during setup.
+
+#### Setting Up Storage & Filesystems
+
+1. Install Ubuntu Server, update it (`sudo apt update && sudo apt upgrade -y`), and follow Jellyfin's official repository installation script.
+2. Add your local Linux user to the GPU rendering group:
+```bash
+sudo usermod -aG render $USER
+
+```
+
+
+3. To give Jellyfin access to extra storage from the host's ZFS mirror pool, attach a new virtual disk via the Proxmox GUI **Hardware** tab.
+4. Partition and format the new disk inside the VM:
+```bash
+# Create a GUID Partition Table (GPT) for drives > 2TiB
+sudo fdisk /dev/sdX
+# Type 'g' (new GPT), 'p' (print/verify), 'w' (write and exit)
+
+# Format as ext4
+sudo mkfs.ext4 /dev/sdX1
+
+```
+
+
+5. Create a target directory and mount it. Avoid mounting random folders straight to the root directory `/`—keep it clean by mounting under `/home` or `/mnt`:
+```bash
+sudo mkdir -p /home/media
+sudo mount /dev/sdX1 /home/media
+
+```
+
+
+6. Make the mount permanent by getting the disk UUID (`sudo blkid`) and adding it to `/etc/fstab`, then reload systemd:
+```bash
+sudo mount -a
+sudo systemctl daemon-reload
+
+```
+
+
+
+#### Moving Data with `rsync`
+
+To transfer existing media libraries over the network, **pushing** the data from the source machine to the destination is best practice. I use `rsync` with the `-P` flag so I can track progress:
+
+```bash
+rsync -avzP /source/directory/ user@192.168.1.100:/home/media/
+
+```
+
+Once the transfer completes, log into the Jellyfin Web UI, point your media libraries to `/home/media`, and enable Intel QuickSync (QSV) in the Transcoding settings.
+
+---
+
+### What's Next?
+
+That wraps up the storage and media side of my server. My next project is spinning up a **Windows Server 2025** VM to attach a few test PCs and experiment with Active Directory (AD) and Domain Controller (DC) configurations. Stay tuned for Part 3!
+That wraps up the storage and media side of my server. My next project is spinning up a Windows Server 2025 VM to attach a few test PCs and experiment with Active Directory (AD) and Domain Controller (DC) configurations. Stay tuned for Part 3!
